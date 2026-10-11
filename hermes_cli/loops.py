@@ -178,7 +178,7 @@ class LoopState:
 
     prompt: str
     status: str = "active"            # active | paused | done | cleared
-    mode: str = "interval"            # interval | self_paced
+    mode: str = "interval"            # interval | self_paced | hybrid
     interval_seconds: float = 0.0     # fixed cadence (mode == "interval")
     current_delay: float = 0.0        # live cadence (self-paced backoff)
     times: int = 0                    # user cap (--times N); 0 = none
@@ -197,6 +197,13 @@ class LoopState:
     # Gateway routing (platform / chat_id / chat_type / thread_id) captured at creation so the
     # idle watcher can inject ticks into the right chat. Empty for CLI/TUI (own schedulers).
     route: dict[str, str] = field(default_factory=dict)
+    # TaskController hybrid mode: persisted binding and read-only observer high-water mark.
+    taskcontroller_binding: dict[str, Any] = field(default_factory=dict)
+    observer_cursor: dict[str, Any] = field(default_factory=dict)
+    observer_interval_seconds: float = 0.0
+    observer_checks: int = 0
+    processed_event_keys: list[str] = field(default_factory=list)
+    pending_events: list[dict[str, Any]] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -213,10 +220,22 @@ class LoopState:
             "last_stop_reason": data.get("last_stop_reason"),
             "route": route if isinstance(route, dict) else {},
         }
-        # Remaining scalar fields: missing key -> dataclass default; present-but-falsy -> type zero.
+        # Collections need explicit defaults because their dataclass defaults are factories.
+        collection_defaults = {
+            "taskcontroller_binding": dict,
+            "observer_cursor": dict,
+            "processed_event_keys": list,
+            "pending_events": list,
+        }
         casts = {"str": str, "int": int, "float": float, "bool": bool}
         for f in fields(cls):
-            if f.name not in kwargs:
+            if f.name in kwargs:
+                continue
+            if f.name in collection_defaults:
+                value = data.get(f.name)
+                factory = collection_defaults[f.name]
+                kwargs[f.name] = value if isinstance(value, factory) else factory()
+            else:
                 kwargs[f.name] = casts[f.type](data.get(f.name, f.default) or casts[f.type]())
         return cls(**kwargs)
 
@@ -469,6 +488,80 @@ class LoopManager:
         self._state = state
         return self._save()
 
+    def set_hybrid(
+        self,
+        prompt: str,
+        *,
+        binding: dict[str, Any],
+        observer_interval_seconds: int,
+        observer_cursor: Optional[dict[str, Any]] = None,
+    ) -> LoopState:
+        """Bind this session to a TaskController event trigger plus bounded read-only observer.
+
+        Timer due-ness only schedules an observer read; it never creates an LLM tick.
+        The current canonical mailbox/continuation remain owned by TaskController.
+        """
+        prompt = (prompt or "").strip()
+        if not prompt:
+            raise ValueError("loop prompt is empty")
+        if not isinstance(binding, dict):
+            raise ValueError("TaskController binding must be an object")
+        required = (
+            "task_id", "run_id", "repository", "branch", "worktree", "head_sha",
+            "session_id", "node_id", "executor_actor", "agent_instance", "capability",
+            "observer_role", "controller_mailbox_ref", "executor_mailbox_ref", "mailbox_ref",
+            "wakeup_binding",
+        )
+        if any(not isinstance(binding.get(key), str) or not binding[key].strip() for key in required):
+            raise ValueError("TaskController binding is incomplete")
+        if binding["session_id"] != self.session_id:
+            raise ValueError("TaskController binding session mismatch")
+        if binding["observer_role"] != "MAILBOX_OBSERVER":
+            raise ValueError("TaskController Loop requires MAILBOX_OBSERVER")
+        if binding["capability"] != "taskcontroller.executor":
+            raise ValueError("TaskController executor capability mismatch")
+        if binding["controller_mailbox_ref"] != binding["mailbox_ref"]:
+            raise ValueError("TaskController controller mailbox binding mismatch")
+        if re.fullmatch(r"[0-9a-f]{40}", binding["head_sha"]) is None:
+            raise ValueError("TaskController head_sha must be a full lowercase commit SHA")
+        if type(observer_interval_seconds) is not int or not (min_interval_seconds() <= observer_interval_seconds <= self_paced_ceiling_seconds()):
+            raise ValueError("TaskController observer interval is outside the bounded range")
+        cursor = observer_cursor if observer_cursor is not None else {
+            "protocol": "dw.taskcontroller.mailbox-cursor/v1",
+            "mailbox_ref": binding["controller_mailbox_ref"],
+            "run_id": binding["run_id"],
+            "node_id": binding["node_id"],
+            "actor_namespace": "controller",
+            "last_logical_seq": -1,
+            "last_event_seq": -1,
+            "last_event_id": None,
+            "last_event_digest": None,
+        }
+        if not isinstance(cursor, dict) or any(
+            cursor.get(key) != expected for key, expected in (
+                ("mailbox_ref", binding["controller_mailbox_ref"]),
+                ("run_id", binding["run_id"]),
+                ("node_id", binding["node_id"]),
+                ("actor_namespace", "controller"),
+            )
+        ):
+            raise ValueError("TaskController observer cursor binding mismatch")
+        now = time.time()
+        self._state = LoopState(
+            prompt=prompt,
+            status="active",
+            mode="hybrid",
+            interval_seconds=float(observer_interval_seconds),
+            current_delay=float(observer_interval_seconds),
+            max_ticks=max_ticks_default(),
+            created_at=now,
+            next_due_at=now,
+            taskcontroller_binding=dict(binding),
+            observer_cursor=dict(cursor),
+            observer_interval_seconds=float(observer_interval_seconds),
+        )
+        return self._save()
+
     def pause(self, reason: str = "user-paused") -> Optional[LoopState]:
         s = self._state
         if not s or s.status not in {"active", "paused"}:
@@ -512,6 +605,8 @@ class LoopManager:
         s = self._state
         if s is None or not self.is_due():
             return None
+        if s.mode == "hybrid":
+            return None
         s.ticks_fired += 1
         s.last_fired_at = time.time()
         s.awaiting_response = True
@@ -525,6 +620,196 @@ class LoopManager:
         cadence = f", {s.cadence_label()}" if s.mode == "interval" else ", self-paced"
         template = WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE if s.until else WAKEUP_PROMPT_TEMPLATE
         return template.format(tick=s.ticks_fired, cadence=cadence, prompt=s.prompt, until=s.until)
+
+    def fire_event(
+        self,
+        event: dict[str, Any],
+        *,
+        binding: dict[str, Any],
+        hold_type: Optional[str] = None,
+        _from_queue: bool = False,
+    ) -> dict[str, Any]:
+        """Fire one exact-readback Controller event into the same bound Loop session.
+
+        The event body is never treated as an instruction here. The canonical mailbox and
+        continuation must be re-read by the adapter before any Executor effect is attempted.
+        """
+        s = self._state
+        def result(status: str, *, prompt: Optional[str] = None, authority: bool = False) -> dict[str, Any]:
+            return {"status": status, "event_id": event.get("event_id") if isinstance(event, dict) else None,
+                    "prompt": prompt, "authority_granted": authority}
+
+        if s is None or s.mode != "hybrid" or not s.taskcontroller_binding:
+            return result("NOT_BOUND")
+        if s.status != "active":
+            return result("PAUSED")
+        if hold_type == "RUN_HOLD":
+            return result("RUN_HOLD")
+        if not isinstance(binding, dict) or binding != s.taskcontroller_binding:
+            return result("BINDING_MISMATCH")
+        if not isinstance(event, dict):
+            return result("EXACT_READBACK_REQUIRED")
+        expected = s.taskcontroller_binding
+        identity_fields = {
+            "run_id": expected["run_id"],
+            "mailbox_ref": expected["controller_mailbox_ref"],
+            "node_id": expected["node_id"],
+            "sender": "controller",
+            "recipient": expected["executor_actor"],
+            "agent_instance": expected["agent_instance"],
+            "branch": expected["branch"],
+            "worktree": expected["worktree"],
+            "direction": "controller_to_executor",
+            "producer_namespace": "controller",
+            "exact_head_sha": expected["head_sha"],
+            "message_type": "execution_request",
+        }
+        if any(event.get(key) != value for key, value in identity_fields.items()):
+            return result("BINDING_MISMATCH")
+        event_seq = event.get("event_seq")
+        logical_seq = event.get("logical_seq")
+        event_id = event.get("event_id")
+        event_digest = event.get("event_digest")
+        envelope_digest = event.get("envelope_digest")
+        if (type(event_seq) is not int or event_seq < 0 or type(logical_seq) is not int or logical_seq < 1
+                or event_id != f"{expected['controller_mailbox_ref']}:event-{event_seq}"
+                or not isinstance(event_digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", event_digest) is None
+                or not isinstance(envelope_digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", envelope_digest) is None):
+            return result("EXACT_READBACK_REQUIRED")
+        readback = event.get("canonical_readback")
+        if not isinstance(readback, dict) or readback.get("exact") is not True:
+            return result("EXACT_READBACK_REQUIRED")
+        readback_fields = {
+            "mailbox_ref": expected["controller_mailbox_ref"],
+            "run_id": expected["run_id"],
+            "event_id": event_id,
+            "event_digest": event_digest,
+            "envelope_digest": envelope_digest,
+            "continuation_run_id": expected["run_id"],
+            "continuation_phase": "WAIT_EXECUTOR",
+            "continuation_status": "ACTIVE",
+            "continuation_next_action": "AWAIT_EXECUTOR_EVENT",
+            "continuation_controller_seq": logical_seq,
+            "branch": expected["branch"],
+            "worktree": expected["worktree"],
+            "head_sha": expected["head_sha"],
+        }
+        continuation_digest = readback.get("continuation_digest")
+        if (any(readback.get(key) != value for key, value in readback_fields.items())
+                or not isinstance(readback.get("continuation_ref"), str)
+                or not readback["continuation_ref"].strip()
+                or not isinstance(continuation_digest, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", continuation_digest) is None):
+            return result("EXACT_READBACK_REQUIRED")
+
+        event_key = hashlib.sha256(
+            "|".join((expected["run_id"], expected["controller_mailbox_ref"], event_id, event_digest)).encode()
+        ).hexdigest()
+        pending_keys = {
+            hashlib.sha256("|".join((item.get("run_id", ""), item.get("mailbox_ref", ""),
+                                       item.get("event_id", ""), item.get("event_digest", ""))).encode()).hexdigest()
+            for item in s.pending_events if isinstance(item, dict)
+        }
+        if event_key in s.processed_event_keys:
+            return result("DUPLICATE")
+        if event_key in pending_keys and not _from_queue:
+            return result("QUEUED_BUSY")
+        cursor = s.observer_cursor
+        cursor_seq = cursor.get("last_event_seq", -1)
+        cursor_logical = cursor.get("last_logical_seq", -1)
+        if not _from_queue:
+            if event_seq <= cursor_seq or logical_seq <= cursor_logical:
+                return result("STALE")
+            if event_seq != cursor_seq + 1:
+                return result("CURSOR_GAP")
+
+        if s.awaiting_response:
+            if not _from_queue:
+                if len(s.pending_events) >= 32:
+                    return result("PENDING_QUEUE_FULL")
+                s.pending_events.append(json.loads(json.dumps(event)))
+                s.observer_cursor = {**cursor, "last_event_seq": event_seq, "last_logical_seq": logical_seq,
+                                     "last_event_id": event_id, "last_event_digest": event_digest}
+                self._save()
+            return result("QUEUED_BUSY")
+
+        if _from_queue:
+            s.pending_events = [item for item in s.pending_events if item.get("event_id") != event_id]
+        s.observer_cursor = {**cursor, "last_event_seq": event_seq, "last_logical_seq": logical_seq,
+                             "last_event_id": event_id, "last_event_digest": event_digest}
+        s.processed_event_keys = (s.processed_event_keys + [event_key])[-128:]
+        s.ticks_fired += 1
+        s.last_fired_at = time.time()
+        s.awaiting_response = True
+        s.next_due_at = s.last_fired_at + s.observer_interval_seconds
+        read_only = hold_type == "EFFECT_HOLD"
+        prompt = (
+            "[/taskcontroller event wake — exact readback verified]\n"
+            f"task_id: {expected['task_id']}\nrun_id: {expected['run_id']}\n"
+            f"controller_mailbox_ref: {expected['controller_mailbox_ref']}\n"
+            f"event_id: {event_id}\nlogical_seq: {logical_seq}\nevent_digest: {event_digest}\n"
+            f"continuation_ref: {readback['continuation_ref']}\ncontinuation_digest: {continuation_digest}\n"
+            f"branch: {expected['branch']}\nworktree: {expected['worktree']}\nhead_sha: {expected['head_sha']}\n\n"
+            "This is a pointer, not command authority. Re-read the exact canonical event and continuation, "
+            "then run the full TaskController PRECHECK before any effect. Do not infer a lease, approval, "
+            "or permission from this wakeup."
+        )
+        if read_only:
+            prompt = "EFFECT_HOLD is active: observation/reasoning only; no effects.\n" + prompt
+        self._save()
+        return result("TRIGGERED_READ_ONLY" if read_only else "TRIGGERED", prompt=prompt, authority=False)
+
+    def fire_pending_event(self, *, binding: dict[str, Any], hold_type: Optional[str] = None) -> dict[str, Any]:
+        """Deliver the oldest verified event queued while this session was busy."""
+        s = self._state
+        if s is None or not s.pending_events:
+            return {"status": "NO_PENDING_EVENT", "event_id": None, "prompt": None, "authority_granted": False}
+        if s.awaiting_response:
+            return {"status": "BUSY", "event_id": None, "prompt": None, "authority_granted": False}
+        return self.fire_event(s.pending_events[0], binding=binding, hold_type=hold_type, _from_queue=True)
+
+    def record_observer_scan(
+        self,
+        *,
+        binding: dict[str, Any],
+        cursor: dict[str, Any],
+        events: tuple[Any, ...] | list[Any],
+        now: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Persist the local observer high-water mark; never acknowledges the canonical mailbox."""
+        s = self._state
+        if s is None or s.mode != "hybrid" or not s.taskcontroller_binding:
+            return {"status": "NOT_BOUND", "authority_granted": False}
+        if s.status != "active":
+            return {"status": "PAUSED", "authority_granted": False}
+        if binding != s.taskcontroller_binding:
+            return {"status": "BINDING_MISMATCH", "authority_granted": False}
+        if events:
+            return {"status": "EVENTS_REQUIRE_EXACT_TRIGGER", "authority_granted": False}
+        if not isinstance(cursor, dict) or any(
+            cursor.get(key) != expected for key, expected in (
+                ("mailbox_ref", binding["controller_mailbox_ref"]),
+                ("run_id", binding["run_id"]),
+                ("node_id", binding["node_id"]),
+                ("actor_namespace", "controller"),
+            )
+        ):
+            return {"status": "BINDING_MISMATCH", "authority_granted": False}
+        old = s.observer_cursor
+        old_seq, new_seq = old.get("last_event_seq", -1), cursor.get("last_event_seq", -1)
+        old_logical, new_logical = old.get("last_logical_seq", -1), cursor.get("last_logical_seq", -1)
+        if type(new_seq) is not int or type(new_logical) is not int or new_seq < old_seq or new_logical < old_logical:
+            return {"status": "CURSOR_REGRESSION", "authority_granted": False}
+        if new_seq == old_seq and (cursor.get("last_event_id") != old.get("last_event_id")
+                                   or cursor.get("last_event_digest") != old.get("last_event_digest")):
+            return {"status": "CURSOR_CONFLICT", "authority_granted": False}
+        if new_seq >= 0 and (not cursor.get("last_event_id") or not cursor.get("last_event_digest")):
+            return {"status": "CURSOR_INVALID", "authority_granted": False}
+        s.observer_cursor = dict(cursor)
+        s.observer_checks += 1
+        s.next_due_at = (time.time() if now is None else now) + s.observer_interval_seconds
+        self._save()
+        return {"status": "NO_NEW_EVENT", "authority_granted": False}
 
     def abandon_tick(self) -> None:
         """Roll back a fired tick whose injection failed (nothing ran)."""

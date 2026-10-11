@@ -61,12 +61,69 @@ def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None
     return None
 
 
-def _owner(home: Path | str, owner: dict[str, Any]) -> dict[str, str]:
-    pinned = {key: owner.get(key) for key in _OWNER_KEYS}
+def _valid_taskcontroller_binding(binding: Any) -> bool:
+    required = (
+        "task_id", "run_id", "repository", "branch", "worktree", "head_sha",
+        "session_id", "executor_actor", "agent_instance", "capability", "observer_role",
+        "controller_mailbox_ref", "executor_mailbox_ref", "mailbox_ref", "wakeup_binding",
+    )
+    return (
+        isinstance(binding, dict)
+        and all(isinstance(binding.get(key), str) and binding[key].strip() for key in required)
+        and binding.get("observer_role") == "MAILBOX_OBSERVER"
+        and binding.get("capability") == "taskcontroller.executor"
+        and binding.get("mailbox_ref") == binding.get("controller_mailbox_ref")
+        and re.fullmatch(r"[0-9a-f]{40}", binding.get("head_sha", "")) is not None
+    )
+
+
+def find_taskcontroller_live_owner(
+    profile_home: Path | str, *, run_id: str, agent_instance: str, wakeup_binding: str,
+) -> dict[str, Any] | None:
+    """Resolve an explicitly bound Desktop session without relying on its chat title."""
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+
+    home = Path(profile_home).resolve()
+    for entry in active_session_registry_snapshot(registry_home=home):
+        if not isinstance(entry, dict):
+            continue
+        meta = entry.get("metadata")
+        if not isinstance(meta, dict):
+            continue
+        binding = meta.get("taskcontroller_binding")
+        if not isinstance(binding, dict) or not _valid_taskcontroller_binding(binding):
+            continue
+        if (entry.get("surface") != "desktop"
+                or meta.get("bot_live_delivery_consumer") is not True
+                or not meta.get("live_session_id")
+                or binding["run_id"] != run_id
+                or binding["agent_instance"] != agent_instance
+                or binding["wakeup_binding"] != wakeup_binding
+                or binding["session_id"] != entry.get("session_id")):
+            continue
+        return {
+            "profile_home": str(home),
+            "session_id": entry["session_id"],
+            "lease_id": entry["lease_id"],
+            "live_session_id": meta["live_session_id"],
+            "taskcontroller_binding": dict(binding),
+        }
+    return None
+
+
+def _owner(home: Path | str, owner: dict[str, Any]) -> dict[str, Any]:
+    pinned: dict[str, Any] = {key: owner.get(key) for key in _OWNER_KEYS}
     if not all(isinstance(value, str) and value for value in pinned.values()):
         raise ValueError("owner requires profile_home, session_id, lease_id and live_session_id")
     if pinned["profile_home"] != str(Path(home).resolve()):
         raise ValueError("owner belongs to a different profile home")
+    binding = owner.get("taskcontroller_binding")
+    if binding is not None:
+        if not isinstance(binding, dict) or not _valid_taskcontroller_binding(binding):
+            raise ValueError("owner has an invalid TaskController binding")
+        if binding["session_id"] != pinned["session_id"]:
+            raise ValueError("TaskController binding belongs to a different session")
+        pinned["taskcontroller_binding"] = json.loads(json.dumps(binding))
     return pinned
 
 
@@ -142,6 +199,14 @@ def _ticket_shape_error(path: Path, record: dict[str, Any]) -> str | None:
         return "created_at/sequence are not integers"
     if not isinstance(owner, dict) or not all(isinstance(owner.get(k), str) and owner[k] for k in _OWNER_KEYS):
         return "owner pin is incomplete"
+    binding = owner.get("taskcontroller_binding")
+    if binding is not None and not _valid_taskcontroller_binding(binding):
+        return "TaskController owner binding is invalid"
+    category = record.get("notification_category", "result")
+    if category not in {"result", "diagnostic", "taskcontroller-wakeup"}:
+        return f"unknown notification category {category!r}"
+    if category == "taskcontroller-wakeup" and binding is None:
+        return "TaskController wakeup ticket has no exact owner binding"
     return None
 
 
@@ -207,6 +272,26 @@ def deliver_to_live_owner(
     pinned = _owner(profile_home, owner)
     if not isinstance(message, str):
         raise ValueError("message must be a string")
+    if notification_category not in {"result", "diagnostic", "taskcontroller-wakeup"}:
+        raise ValueError("unsupported notification category")
+    if notification_category == "taskcontroller-wakeup":
+        binding = pinned.get("taskcontroller_binding")
+        if not isinstance(binding, dict) or not _valid_taskcontroller_binding(binding):
+            raise ValueError("TaskController wakeup requires an exact owner binding")
+        try:
+            pointer = json.loads(message)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("TaskController wakeup must be a JSON pointer") from exc
+        pointer_keys = {"protocol", "run_id", "sender", "recipient", "mailbox_ref", "seq", "updated_at"}
+        if (not isinstance(pointer, dict) or set(pointer) != pointer_keys
+                or pointer.get("protocol") != "dw.taskcontroller.wakeup/v1"
+                or pointer.get("run_id") != binding["run_id"]
+                or pointer.get("sender") != "controller"
+                or pointer.get("recipient") != binding["executor_actor"]
+                or pointer.get("mailbox_ref") != binding["controller_mailbox_ref"]
+                or type(pointer.get("seq")) is not int or pointer["seq"] < 0
+                or not isinstance(pointer.get("updated_at"), str) or not pointer["updated_at"]):
+            raise ValueError("TaskController wakeup pointer does not match its owner binding")
     key = _delivery_id(delivery_id if delivery_id is not None else uuid.uuid4().hex)
     with _locked(profile_home) as root:
         path = root / f"{key}.json"
@@ -219,7 +304,7 @@ def deliver_to_live_owner(
         record = dict(delivery_id=key, id=key, owner=pinned, **pinned,
                       message=message, status="queued", created_at=time.time_ns(),
                       sequence=_next_sequence(root), **({"author": dict(author)} if author else {}))
-        if notification_category == "diagnostic":
+        if notification_category in {"diagnostic", "taskcontroller-wakeup"}:
             record["notification_category"] = notification_category
         _write(path, record)
         return record
@@ -228,6 +313,8 @@ def deliver_to_live_owner(
 def _matches(home: Path | str, record: dict, owner: dict) -> bool:
     pinned = record["owner"]
     if any(pinned[key] != owner[key] for key in ("profile_home", "lease_id", "live_session_id")):
+        return False
+    if pinned.get("taskcontroller_binding") != owner.get("taskcontroller_binding"):
         return False
     if pinned["session_id"] == owner["session_id"]:
         return True
